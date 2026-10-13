@@ -18,6 +18,7 @@ Run with:
 """
 
 import random
+import time
 from datetime import datetime, timedelta
 
 import numpy as np
@@ -67,12 +68,43 @@ with st.sidebar:
     )
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def load_price_history(sym: str, per: str) -> pd.DataFrame:
-    df = yf.Ticker(sym).history(period=per)
+def _fetch_history(sym: str, per: str) -> pd.DataFrame:
+    """
+    Fetch price history from Yahoo with retries and a second method as fallback.
+    Raises RuntimeError (with the underlying reason) if nothing comes back, so a failed
+    request is NOT stored in Streamlit's cache.
+    """
+    last_err = None
+    for attempt in range(3):
+        try:
+            df = yf.Ticker(sym).history(period=per)
+            if df is not None and not df.empty:
+                break
+        except Exception as exc:  # rate limit, network, JSON errors ...
+            last_err = exc
+        try:
+            df = yf.download(sym, period=per, progress=False)
+            if df is not None and not df.empty:
+                break
+        except Exception as exc:
+            last_err = exc
+        df = None
+        time.sleep(1.5 * (attempt + 1))
+
+    if df is None or df.empty:
+        reason = f" Yahoo said: {last_err}" if last_err else ""
+        raise RuntimeError(
+            f"Yahoo Finance returned no data for '{sym}'.{reason} If the symbol is right, Yahoo may be "
+            f"rate-limiting this server — wait a few minutes and try again."
+        )
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     return df
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_price_history(sym: str, per: str) -> pd.DataFrame:
+    return _fetch_history(sym, per)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -145,7 +177,10 @@ if not ticker:
 try:
     hist = load_price_history(ticker, period)
 except Exception as e:
-    st.error(f"Couldn't load price data for {ticker}: {e}")
+    st.error(
+        f"Couldn't load price data for {ticker}. {e}\n\n"
+        f"Also check the exchange dropdown matches the symbol (NSE needs .NS, BSE needs .BO)."
+    )
     st.stop()
 
 if hist.empty:
@@ -595,12 +630,12 @@ with tabs[5]:
 
     @st.cache_data(ttl=3600, show_spinner=False)
     def load_long_history(sym: str) -> pd.DataFrame:
-        df = yf.Ticker(sym).history(period="10y")
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        return df
+        return _fetch_history(sym, "10y")
 
-    long_hist = load_long_history(ticker)
+    try:
+        long_hist = load_long_history(ticker)
+    except Exception:
+        long_hist = pd.DataFrame()
 
     if long_hist.empty or len(long_hist) < 60:
         st.info("Not enough history available to compute seasonality for this ticker.")
